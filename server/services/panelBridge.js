@@ -91,6 +91,10 @@ class PanelBridge extends EventEmitter {
     this.statusInterval = null;
     this.heartbeatInterval = null;
     this.lastHeartbeatAt = null;
+    // Timestamp (ms) of the last confirmed server stop, if any -- heartbeats
+    // written before it no longer count as evidence the mod is alive. See
+    // invalidateModLiveness().
+    this.heartbeatInvalidBefore = null;
     this.fileWatcher = null;
     this.sftpTransport = null;
     this.lastSftpStatus = null;
@@ -609,6 +613,9 @@ class PanelBridge extends EventEmitter {
     // Reset failure counter on start
     this.consecutiveFailures = 0;
     this.lastStatusFileCheck = 0;
+    // A fresh start clears any liveness invalidation from a previous stop: the
+    // mod is about to write new heartbeats, which must count again.
+    this.heartbeatInvalidBefore = null;
     this.queueState.initialized = false;
     this.ensureQueueProtocol();
 
@@ -1533,6 +1540,24 @@ class PanelBridge extends EventEmitter {
       const stats = fs.statSync(statusFile);
       const age = Date.now() - stats.mtimeMs;
 
+      // A heartbeat written before the panel confirmed the server stopped
+      // cannot be evidence that it is up. Checked here -- before BOTH the
+      // skip-re-read fast path and the full read below -- so the idle grace
+      // can never resurrect a pre-stop status file. See
+      // invalidateModLiveness() for why this is safe when the scan that
+      // confirmed the stop was itself a false negative.
+      if (
+        this.heartbeatInvalidBefore != null &&
+        stats.mtimeMs < this.heartbeatInvalidBefore
+      ) {
+        if (this.modStatus?.alive) {
+          this.modStatus.alive = false;
+          this.modStatus._wasAlive = false;
+          this.emit("modStatus", this.modStatus);
+        }
+        return;
+      }
+
       // Use relaxed threshold when server is idle (0 players) — PZ stops Lua ticks with no players
       const staleThreshold = (this.modStatus?.playerCount === 0)
         ? this.config.statusStaleIdleMs
@@ -1795,6 +1820,39 @@ class PanelBridge extends EventEmitter {
    */
   isModConnected() {
     return this.modStatus?.alive === true;
+  }
+
+  /**
+   * Invalidate the mod's liveness claim after the panel has itself confirmed
+   * the server process is gone.
+   *
+   * `statusStaleIdleMs` (5 min) exists for a genuinely-running but EMPTY
+   * server: PZ stops ticking Lua when nobody is connected, so a quiet status
+   * file is not on its own evidence the server died. It must not survive a
+   * stop the panel has already confirmed, though -- after the process is gone
+   * that same quiet file keeps isModConnected() true for up to five minutes,
+   * and the dashboard's Start/Stop branch is chosen from
+   * `hostRunning || rconConnected || bridgeActive`, so the UI stays on the Stop
+   * branch with no Start/Restart button for the whole grace period
+   * (2026-09-29 operator report: "clicked Stop, no start button appears").
+   *
+   * Self-correcting by construction: only heartbeats whose mtime is BEFORE
+   * this moment stop counting. A live mod rewrites its status file every few
+   * seconds, so a server the panel wrongly believes is stopped (process-scan
+   * false negative -- exactly the case the client's bridge fallback exists
+   * for) is marked connected again on the next status check, while a stop the
+   * panel confirmed has no such writer and stays offline.
+   */
+  invalidateModLiveness(reason = "server stopped") {
+    this.heartbeatInvalidBefore = Date.now();
+    if (this.modStatus?.alive) {
+      this.modStatus.alive = false;
+      this.modStatus._wasAlive = false;
+      this.emit("modStatus", this.modStatus);
+    }
+    log.info(
+      `Mod liveness invalidated (${reason}) -- heartbeats written before this moment no longer count as evidence the server is up`,
+    );
   }
 
   // sweep-round5 follow-up (2026-09-07, release-1-2-17): ping() used to

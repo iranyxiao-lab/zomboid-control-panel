@@ -3153,6 +3153,18 @@ export async function checkServerStatusNow(detectionReason = "watchdog") {
       if (runningChanged && !running) {
         const stopReason = classifyStopReason(serverManager, rconService);
         serverManager.lastStopReason = stopReason;
+        // The panel has just POSITIVELY confirmed the process is gone, so the
+        // mod's heartbeat file must stop counting as evidence the server is
+        // up. That file can legitimately sit up to statusStaleIdleMs (5 min)
+        // behind on an empty server -- PZ stops ticking Lua with 0 players --
+        // but the panel's own confirmed stop is proof no writer is coming,
+        // and without this the dashboard keeps choosing the Stop branch and
+        // offers no Start/Restart button for the rest of that grace
+        // (2026-09-29 operator report). See
+        // PanelBridge.invalidateModLiveness().
+        panelBridge?.invalidateModLiveness?.(
+          `server stopped (reason: ${stopReason.reason}, detected by ${detectionReason})`,
+        );
         logServerEvent(
           "server_stop",
           // "(detected by X)" stays an intact, standalone parenthetical --
@@ -3179,6 +3191,20 @@ export async function checkServerStatusNow(detectionReason = "watchdog") {
             ),
           );
       }
+    }
+    // The FIRST observation after a panel start is not a "transition", but it
+    // is just as positive: the panel has scanned and found no process. A
+    // heartbeat file written before this moment therefore cannot be evidence
+    // the server is up either -- without this, a panel restarted while the
+    // server was ALREADY stopped kept reporting PanelBridge active (the file
+    // is younger than the 5-minute statusStaleIdleMs grace) and showed no
+    // Start button until that grace expired. Same fix as the running -> stopped
+    // branch above, same self-correcting property: a live mod keeps rewriting
+    // the file, so a scan false negative re-connects on the next check. 2026-09-29.
+    if (lastKnownRunning === null && !running) {
+      panelBridge?.invalidateModLiveness?.(
+        `no server process on the first status check after panel startup (detected by ${detectionReason})`,
+      );
     }
     lastKnownRunning = running;
     lastKnownPhase = phase;
